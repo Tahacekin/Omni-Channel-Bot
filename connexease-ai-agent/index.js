@@ -74,29 +74,23 @@ function ipAllowlist(req, res, next) {
     }
 }
 
+// PASTE THIS ENTIRE FUNCTION INTO YOUR index.js FILE
 function verifyConnexeaseSignature(req, res, next) {
     const signature = req.headers['x-connexease-webhook-sign'];
-    if (!signature) {
-        return res.status(403).send('Signature missing.');
-    }
-    const channelUuid = req.body.channel?.uuid;
-    if (!channelUuid) {
-        return res.status(400).send('Invalid payload for signature check.');
-    }
     const secret = process.env.CONNEXEASE_WEBHOOK_SECRET;
-    const hmac = crypto.createHmac('sha256', secret);
-    hmac.update(channelUuid, 'utf-8');
-    const expectedSignature = hmac.digest('base64');
 
-    // Debugging
-    console.log(`Received Signature:  |${signature}|`);
-    console.log(`Generated Signature: |${expectedSignature}|`);
+    // Log for debugging
+    console.log(`Received Signature: |${signature}|`);
+    console.log(`Secret Key to Match: |${secret}|`);
 
+    // TEMPORARY FIX: Check if the received signature is just the raw secret key.
     if (signature !== secret) {
-        console.error("Webhook signature verification FAILED!");
+        console.error("Webhook signature verification FAILED! The received signature does not match the secret key.");
         return res.status(403).send('Invalid signature.');
     }
-    console.log("Webhook signature verified successfully.");
+
+    // If the check passes, we proceed.
+    console.log("Webhook signature check PASSED (using temporary method).");
     next();
 }
 
