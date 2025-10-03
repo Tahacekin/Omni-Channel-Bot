@@ -1,27 +1,44 @@
-// index.js (UPDATED with new Tailwind CSS Dashboard)
+// index.js (UPDATED for Agent-Assist Dashboard with WebSockets)
 require('dotenv').config();
 const express = require('express');
+const http = require('http');
+const WebSocket = require('ws');
 const fs = require('fs').promises;
 const path = require('path');
 const crypto = require('crypto');
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const axios = require('axios');
 
-// 1. Initialize App & AI
+// --- 1. INITIALIZATION ---
 const app = express();
-app.use(express.json({
-    verify: (req, res, buf) => {
-        req.rawBody = buf;
-    }
-}));
+const server = http.createServer(app); // Express app will run on an HTTP server
+const wss = new WebSocket.Server({ server }); // WebSocket server will share the same server
+
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-latest" });
 let knowledgeBase = '';
 
-// --- In-memory store for the last 50 messages ---
-const receivedMessages = [];
+// --- In-memory store for conversations (more advanced than just messages) ---
+// We'll store conversations keyed by their ID
+const conversations = new Map();
 
-// --- JWT Authentication, IP Allowlist, Signature Verification ---
+app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
+
+// --- 2. WEBSOCKET LOGIC ---
+wss.on('connection', ws => {
+    console.log('Dashboard client connected via WebSocket');
+    ws.on('close', () => console.log('Dashboard client disconnected'));
+});
+
+function broadcast(data) {
+    wss.clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify(data));
+        }
+    });
+}
+
+// --- 3. SECURITY & API MIDDLEWARE ---
 let connexeaseToken = null;
 let tokenExpiresAt = null;
 
@@ -53,7 +70,6 @@ function ipAllowlist(req, res, next) {
         next();
     } else {
         console.warn(`Blocked request from unauthorized IP: ${firstIp}`);
-        if (receivedMessages.length > 0) receivedMessages[0].status = '❌ FAILED (IP Block)';
         res.status(403).send('Forbidden: IP address not allowed.');
     }
 }
@@ -61,12 +77,10 @@ function ipAllowlist(req, res, next) {
 function verifyConnexeaseSignature(req, res, next) {
     const signature = req.headers['x-connexease-webhook-sign'];
     if (!signature) {
-        if (receivedMessages.length > 0) receivedMessages[0].status = '❌ FAILED (Missing)';
         return res.status(403).send('Signature missing.');
     }
     const channelUuid = req.body.channel?.uuid;
     if (!channelUuid) {
-        if (receivedMessages.length > 0) receivedMessages[0].status = '❌ FAILED (Bad Payload)';
         return res.status(400).send('Invalid payload for signature check.');
     }
     const secret = process.env.CONNEXEASE_WEBHOOK_SECRET;
@@ -74,15 +88,11 @@ function verifyConnexeaseSignature(req, res, next) {
     hmac.update(channelUuid, 'utf-8');
     const expectedSignature = hmac.digest('base64');
 
-    // --- ADD THESE TWO LINES FOR DEBUGGING ---
+    // Debugging
     console.log(`Received Signature:  |${signature}|`);
     console.log(`Generated Signature: |${expectedSignature}|`);
-    // -----------------------------------------
 
     if (signature !== expectedSignature) {
-        if (receivedMessages.length > 0) {
-            receivedMessages[0].status = '❌ FAILED (Mismatch)';
-        }
         console.error("Webhook signature verification FAILED!");
         return res.status(403).send('Invalid signature.');
     }
@@ -90,18 +100,17 @@ function verifyConnexeaseSignature(req, res, next) {
     next();
 }
 
-// --- AI and Connexease Reply Functions ---
 async function getAIResponse(userMessage) {
     if (!knowledgeBase) {
         knowledgeBase = await fs.readFile(path.join(__dirname, 'knowledgebase.txt'), 'utf-8');
     }
-    const fullPrompt = `You are a helpful customer service assistant for a network of clinics called Climed. You must answer user questions based ONLY on the information provided in the following knowledge base. Do not make up any information. If the answer is not in the knowledge base, politely state that you do not have that information and a human agent will assist them shortly. Your answers must be in TURKISH. --- KNOWLEDGE BASE START --- ${knowledgeBase} --- KNOWLEDGE BASE END --- User Question: "${userMessage}"`;
+    const fullPrompt = `You are an AI assistant suggesting replies for a human agent. Based on the user's message, provide a helpful and concise response. USER MESSAGE: "${userMessage}" --- KNOWLEDGE BASE: ${knowledgeBase} --- SUGGESTED RESPONSE (in TURKISH):`;
     try {
         const result = await model.generateContent(fullPrompt);
         return result.response.text();
     } catch (error) {
         console.error("Error getting AI response:", error);
-        return "Üzgünüm, talebinizi işlerken bir sorun oluştu. En kısa sürede bir temsilcimiz size yardımcı olacaktır.";
+        return "Sorry, I couldn't generate a suggestion.";
     }
 }
 
@@ -119,147 +128,252 @@ async function sendConnexeaseReply(conversationId, messageText) {
     }
 }
 
-// --- Middleware to log all incoming messages for the dashboard ---
-function logMessageForDashboard(req, res, next) {
+// --- 4. WEBHOOK HANDLER (UPDATED TO STORE & BROADCAST) ---
+app.post('/webhook', ipAllowlist, verifyConnexeaseSignature, async (req, res) => {
+    res.status(200).send('Event received'); // Acknowledge immediately
+
     const hookType = req.body.hook;
     const payload = req.body.payload;
-    if (hookType === 'message.created' || hookType === 'conversation.created') {
-        const messageContent = payload.content || payload.messages?.content;
-        const customer = payload.customer || payload.messages?.customer;
-        if (messageContent) {
-            const messageData = {
-                from: customer?.name || customer?.phone_number || 'Unknown',
-                content: messageContent,
-                timestamp: new Date().toLocaleString('tr-TR', { timeZone: 'Europe/Istanbul' }),
-                status: 'Pending'
-            };
-            receivedMessages.unshift(messageData);
-            if (receivedMessages.length > 50) receivedMessages.pop();
-        }
+    let conversationId, message;
+
+    if (hookType === 'message.created') {
+        if (!payload.customer) return; // Ignore agent messages
+        conversationId = payload.conversation_uuid;
+        message = {
+            sender: 'customer',
+            content: payload.content,
+            timestamp: new Date().toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })
+        };
+    } else if (hookType === 'conversation.created') {
+        conversationId = payload.uuid;
+        message = {
+            sender: 'customer',
+            content: payload.messages?.content,
+            timestamp: new Date().toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })
+        };
+    } else {
+        return; // We don't care about other event types for now
     }
-    next();
-}
 
-// --- UPDATED Dashboard Endpoint with New Design ---
+    if (!message || !message.content) return;
+
+    // Store the message
+    if (!conversations.has(conversationId)) {
+        conversations.set(conversationId, {
+            id: conversationId,
+            customer: payload.customer || payload.messages?.customer,
+            messages: []
+        });
+    }
+    const conversation = conversations.get(conversationId);
+    conversation.messages.push(message);
+
+    // Broadcast the new message to all connected dashboards
+    broadcast({ type: 'newMessage', payload: { conversationId, message, customer: conversation.customer } });
+
+    // Generate AI suggestion and broadcast it
+    const aiSuggestion = await getAIResponse(message.content);
+    broadcast({ type: 'aiSuggestion', payload: { conversationId, suggestion: aiSuggestion } });
+});
+
+// --- 5. API ENDPOINTS FOR THE DASHBOARD ---
+// Endpoint to get the list of conversations
+app.get('/api/conversations', (req, res) => {
+    const convoList = Array.from(conversations.values()).map(c => ({
+        id: c.id,
+        name: c.customer?.name || c.customer?.phone_number || 'Unknown',
+        lastMessage: c.messages[c.messages.length - 1]?.content.substring(0, 30) + '...' || 'No messages yet'
+    }));
+    res.json(convoList);
+});
+
+// Endpoint to get the messages for a specific conversation
+app.get('/api/conversations/:id', (req, res) => {
+    const conversation = conversations.get(req.params.id);
+    if (conversation) {
+        res.json(conversation.messages);
+    } else {
+        res.status(404).send('Conversation not found');
+    }
+});
+
+// --- 6. THE NEW DASHBOARD FRONT-END ---
 app.get('/dashboard', (req, res) => {
-    const messagesHtml = receivedMessages.map(msg => {
-        let statusIcon, statusColor, statusText;
-        switch (msg.status) {
-            case '✅ Verified':
-                statusIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="h-4 w-4"><path d="M20 6 9 17l-5-5"></path></svg>`;
-                statusColor = 'text-green-400';
-                statusText = 'Verified';
-                break;
-            case '❌ FAILED (Mismatch)':
-            case '❌ FAILED (Missing)':
-            case '❌ FAILED (Bad Payload)':
-            case '❌ FAILED (IP Block)':
-                statusIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="h-4 w-4"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg>`;
-                statusColor = 'text-red-400';
-                statusText = 'Failed';
-                break;
-            default:
-                statusIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="h-4 w-4"><path d="M10 20a1 1 0 0 0 .553.895l2 1A1 1 0 0 0 14 21v-7a2 2 0 0 1 .517-1.341L21.74 4.67A1 1 0 0 0 21 3H3a1 1 0 0 0-.742 1.67l7.225 7.989A2 2 0 0 1 10 14z"></path></svg>`;
-                statusColor = 'text-yellow-400';
-                statusText = 'Processing';
-                break;
-        }
-
-        return `
-            <div class="relative flex items-start sm:items-center justify-between rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 mb-4 flex-col sm:flex-row">
-              <div class="pl-3 flex-grow mb-2 sm:mb-0">
-                <h3 class="text-base font-medium tracking-tight text-white">${msg.content}</h3>
-                <div class="mt-1 flex items-center gap-3 text-xs text-neutral-400">
-                  <span>From: ${msg.from}</span>
-                  <span>•</span>
-                  <span>${msg.timestamp}</span>
-                </div>
-              </div>
-              <div class="flex items-center gap-2 text-sm ${statusColor} pl-3 sm:pl-0">
-                ${statusIcon}
-                <span class="font-mono text-xs">${statusText}</span>
-              </div>
-            </div>`;
-    }).join('');
-
     const dashboardHtml = `
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Message Dashboard</title>
-        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
-        <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+        <title>Agent-Assist Dashboard</title>
         <script src="https://cdn.tailwindcss.com"></script>
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
         <style>
-            .font-manrope { font-family: 'Manrope', sans-serif; }
-            @keyframes gradientFlow { 0% {background-position: 0% 50%;} 50% {background-position: 100% 50%;} 100% {background-position: 0% 50%;} }
-            .animate-gradient { background-size: 200% 200%; animation: gradientFlow 3s ease-in-out infinite; }
+            body { font-family: 'Inter', sans-serif; }
+            .message-bubble-in { animation: messageSlideIn 0.3s ease-out forwards; }
+            @keyframes messageSlideIn { 0% { transform: translateY(10px); opacity: 0; } 100% { transform: translateY(0); opacity: 1; } }
+            ::-webkit-scrollbar { width: 4px; }
+            ::-webkit-scrollbar-track { background: transparent; }
+            ::-webkit-scrollbar-thumb { background: #4a5568; border-radius: 2px; }
         </style>
     </head>
-    <body class="antialiased min-h-screen flex flex-col items-center text-neutral-200 bg-gradient-to-tl from-[#030408] to-[#283343] p-6" style="font-family:'Inter', sans-serif;">
-        <div class="w-full max-w-4xl text-center mb-12">
-            <h1 class="text-4xl md:text-5xl tracking-tight text-white mb-4 font-manrope font-medium">
-                Message <span class="bg-gradient-to-r from-[#2a7fff] via-[#0ea5e9] to-[#22d3ee] bg-clip-text text-transparent animate-gradient">Dashboard</span>
-            </h1>
-            <p class="text-lg md:text-xl text-neutral-400 max-w-2xl mx-auto">
-                Real-time log of incoming webhook messages.
-            </p>
+    <body class="bg-gray-900 text-gray-200 flex h-screen">
+
+        <div id="chat-list-pane" class="w-1/4 bg-gray-950 border-r border-gray-800 flex flex-col">
+            <div class="p-4 border-b border-gray-800">
+                <h1 class="text-xl font-bold">Active Chats</h1>
+            </div>
+            <div id="chat-list-container" class="flex-grow overflow-y-auto">
+                </div>
         </div>
-        <div class="w-full max-w-4xl shadow-[0_20px_50px_-10px_rgba(0,0,0,0.6)] relative overflow-hidden border-white/10 border rounded-3xl backdrop-blur-sm">
-            <div class="p-8">
-                ${messagesHtml || '<p class="text-center text-neutral-400">No messages received yet. Send a message to the WhatsApp number to begin.</p>'}
+
+        <div id="chat-history-pane" class="w-2/4 flex flex-col bg-gray-900">
+            <div id="chat-header" class="p-4 border-b border-gray-800 text-center text-gray-500">Select a chat to view messages</div>
+            <div id="message-container" class="flex-grow p-6 overflow-y-auto flex flex-col-reverse">
+                <div id="messages" class="space-y-4">
+                    </div>
             </div>
         </div>
+
+        <div class="w-1/4 bg-gray-950 border-l border-gray-800 flex flex-col">
+            <div class="p-4 border-b border-gray-800">
+                <h2 class="text-xl font-bold">AI Assistant</h2>
+            </div>
+            <div class="flex-grow p-4 overflow-y-auto" id="ai-suggestions-container">
+                 </div>
+        </div>
+
+    <script>
+        const chatListContainer = document.getElementById('chat-list-container');
+        const messageContainer = document.getElementById('messages');
+        const aiSuggestionsContainer = document.getElementById('ai-suggestions-container');
+        const chatHeader = document.getElementById('chat-header');
+        let activeConversationId = null;
+
+        // --- WebSocket Connection ---
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(\`\${wsProtocol}//\${window.location.host}\`);
+
+        ws.onopen = () => console.log('WebSocket connection established');
+        ws.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            console.log('Received from WS:', data);
+
+            if (data.type === 'newMessage') {
+                updateChatList(data.payload.conversationId, data.payload.customer, data.payload.message);
+                if (data.payload.conversationId === activeConversationId) {
+                    appendMessage(data.payload.message);
+                }
+            } else if (data.type === 'aiSuggestion' && data.payload.conversationId === activeConversationId) {
+                 displayAiSuggestion(data.payload.suggestion);
+            }
+        };
+        ws.onclose = () => console.log('WebSocket connection closed');
+
+
+        // --- UI Functions ---
+        async function loadConversations() {
+            const response = await fetch('/api/conversations');
+            const conversations = await response.json();
+            chatListContainer.innerHTML = '';
+            conversations.forEach(convo => {
+                const convoEl = document.createElement('div');
+                convoEl.className = 'p-4 border-b border-gray-800 cursor-pointer hover:bg-gray-800';
+                convoEl.id = \`convo-\${convo.id}\`;
+                convoEl.innerHTML = \`
+                    <p class="font-semibold">\${convo.name}</p>
+                    <p class="text-smult text-gray-400 truncate">\${convo.lastMessage}</p>
+                \`;
+                convoEl.onclick = () => loadConversationMessages(convo.id, convo.name);
+                chatListContainer.appendChild(convoEl);
+            });
+        }
+
+        async function loadConversationMessages(convoId, name) {
+            if (activeConversationId) {
+                document.getElementById(\`convo-\${activeConversationId}\`)?.classList.remove('bg-blue-900/50');
+            }
+            activeConversationId = convoId;
+            document.getElementById(\`convo-\${convoId}\`)?.classList.add('bg-blue-900/50');
+
+            chatHeader.innerHTML = \`<h2 class="text-lg font-semibold text-white">\${name}</h2>\`;
+            messageContainer.innerHTML = '<p class="text-center text-gray-506">' +
+                                       'Loading messages...</p>';
+            aiSuggestionsContainer.innerHTML = '';
+            
+            const response = await fetch(\`/api/conversations/\${convoId}\`);
+            const messages = await response.json();
+            messageContainer.innerHTML = '';
+            messages.forEach(appendMessage);
+        }
+
+        function appendMessage(message) {
+            const messageEl = document.createElement('div');
+            if (message.sender === 'customer') {
+                messageEl.className = 'flex justify-start';
+                messageEl.innerHTML = \`
+                    <div class="bg-gray-700 rounded-lg p-3 max-w-lg">
+                        <p class="text-sm">\${message.content}</p>
+                        <p class="text-xs text-gray-400 text-right mt-1">\${message.timestamp}</p>
+                    </div>
+                \`;
+            } else { // For human agent replies (not implemented yet, but for future)
+                 messageEl.className = 'flex justify-end';
+                 messageEl.innerHTML = \`... // Agent message style\`;
+            }
+            messageContainer.appendChild(messageEl);
+        }
+        
+        function displayAiSuggestion(suggestion) {
+            const suggestionHtml = \`
+                <div class="flex flex-col space-y-3 message-bubble-in">
+                    <div class="flex items-start">
+                        <div class="w-6 h-6 rounded-full bg-blue-600 flex items-center justify-center text-white text-xs mr-2 font-bold">AI</div>
+                        <div class="bg-gray-800 rounded-lg rounded-tl-none p-3 max-w-[80%] shadow-md">
+                            <p class="text-gray-300 text-sm">\${suggestion}</p>
+                        </div>
+                    </div>
+                </div>
+            \`;
+            aiSuggestionsContainer.innerHTML = suggestionHtml;
+        }
+
+        function updateChatList(convoId, customer, message) {
+                let convoEl = document.getElementById(\`convo-\${convoId}\`);
+            if (!convoEl) {
+                 // New conversation, add it to the top
+                 convoEl = document.createElement('div');
+                 convoEl.className = 'p-4 border-b border-gray-800 cursor-pointer hover:bg-gray-800';
+                 convoEl.id = \`convo-\${convoId}\`;
+                 convoEl.onclick = () => loadConversationMessages(convoId, customer.name || customer.phone_number);
+                 chatListContainer.prepend(convoEl);
+            }
+            // Update content and move to top
+            convoEl.innerHTML = \`
+                <p class="font-semibold">\${customer.name || customer.phone_number || 'Unknown'}</p>
+                <p class="text-sm text-gray-400 truncate">\${message.content.substring(0, 30)}...</p>
+            \`;
+            chatListContainer.prepend(convoEl);
+        }
+
+        // Initial load
+        loadConversations();
+    </script>
     </body>
-    </html>`;
+    </html>
+    `;
     res.send(dashboardHtml);
 });
 
 
-// --- UPDATED Webhook Endpoint ---
-app.post('/webhook', logMessageForDashboard, ipAllowlist, (req, res, next) => {
-    if (receivedMessages.length > 0) receivedMessages[0].status = 'IP OK';
-    verifyConnexeaseSignature(req, res, next);
-}, async (req, res) => {
-    if (receivedMessages.length > 0) receivedMessages[0].status = '✅ Verified';
-    console.log("Webhook received and passed security checks:", JSON.stringify(req.body, null, 2));
-    res.status(200).send('Event received');
-    const hookType = req.body.hook;
-    const payload = req.body.payload;
-    if (hookType === 'message.created' && payload.customer && !payload.agent) {
-        const userMessage = payload.content;
-        const conversationId = payload.conversation_uuid;
-        if (userMessage && userMessage.trim() !== "") {
-            console.log(`Processing message from customer: "${userMessage}"`);
-            const aiReply = await getAIResponse(userMessage);
-            await sendConnexeaseReply(conversationId, aiReply);
-        } else {
-            console.log("Received message without text content, skipping.");
-        }
-    } else if (hookType === 'conversation.created' && payload.messages?.content) {
-        const userMessage = payload.messages.content;
-        const conversationId = payload.uuid;
-        if (userMessage && userMessage.trim() !== "") {
-            console.log(`Processing first message in new conversation: "${userMessage}"`);
-            const aiReply = await getAIResponse(userMessage);
-            await sendConnexeaseReply(conversationId, aiReply);
-        } else {
-            console.log("Received new conversation without text content, skipping.");
-        }
-    }
-});
-
-
-// --- Start Server ---
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, async () => {
+// --- 7. START SERVER ---
+// We use server.listen instead of app.listen to handle both HTTP and WebSocket traffic
+server.listen(process.env.PORT || 3000, async () => {
     try {
         knowledgeBase = await fs.readFile(path.join(__dirname, 'knowledgebase.txt'), 'utf-8');
-        console.log('Knowledge base loaded into memory.');
+        console.log('Knowledge base loaded.');
     } catch (error) {
         console.error('Failed to load knowledge base on startup:', error);
     }
-    console.log(`Server is running on port ${PORT}`);
+    console.log(`Server is running on port ${process.env.PORT || 3000}`);
 });
