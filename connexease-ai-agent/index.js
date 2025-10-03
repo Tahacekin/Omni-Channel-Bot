@@ -15,7 +15,7 @@ const server = http.createServer(app); // Express app will run on an HTTP server
 const wss = new WebSocket.Server({ server }); // WebSocket server will share the same server
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-latest" });
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash-latest" });
 let knowledgeBase = '';
 
 // --- In-memory store for conversations (more advanced than just messages) ---
