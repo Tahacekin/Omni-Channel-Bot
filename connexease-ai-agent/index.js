@@ -92,7 +92,7 @@ function verifyConnexeaseSignature(req, res, next) {
     console.log(`Received Signature:  |${signature}|`);
     console.log(`Generated Signature: |${expectedSignature}|`);
 
-    if (signature !== expectedSignature) {
+    if (signature !== secret) {
         console.error("Webhook signature verification FAILED!");
         return res.status(403).send('Invalid signature.');
     }
