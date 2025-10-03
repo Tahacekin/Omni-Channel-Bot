@@ -1,4 +1,4 @@
-// index.js (UPDATED with a simple message dashboard)
+// index.js (UPDATED with new Tailwind CSS Dashboard)
 require('dotenv').config();
 const express = require('express');
 const fs = require('fs').promises;
@@ -18,7 +18,7 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-latest" });
 let knowledgeBase = '';
 
-// --- NEW: In-memory store for the last 50 messages ---
+// --- In-memory store for the last 50 messages ---
 const receivedMessages = [];
 
 // --- JWT Authentication, IP Allowlist, Signature Verification ---
@@ -48,13 +48,12 @@ async function getConnexeaseToken() {
 function ipAllowlist(req, res, next) {
     const allowedIp = '34.89.215.92';
     const clientIpString = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-    console.log(`Incoming request from IP chain: ${clientIpString}`);
     const firstIp = clientIpString.split(',')[0].trim();
     if (firstIp === allowedIp) {
-        console.log(`Allowing request as first IP '${firstIp}' matches.`);
         next();
     } else {
         console.warn(`Blocked request from unauthorized IP: ${firstIp}`);
+        if (receivedMessages.length > 0) receivedMessages[0].status = '❌ FAILED (IP Block)';
         res.status(403).send('Forbidden: IP address not allowed.');
     }
 }
@@ -62,16 +61,12 @@ function ipAllowlist(req, res, next) {
 function verifyConnexeaseSignature(req, res, next) {
     const signature = req.headers['x-connexease-webhook-sign'];
     if (!signature) {
-        if (receivedMessages.length > 0) {
-            receivedMessages[0].signature_ok = '❌ FAILED (Missing)';
-        }
+        if (receivedMessages.length > 0) receivedMessages[0].status = '❌ FAILED (Missing)';
         return res.status(403).send('Signature missing.');
     }
     const channelUuid = req.body.channel?.uuid;
     if (!channelUuid) {
-        if (receivedMessages.length > 0) {
-            receivedMessages[0].signature_ok = '❌ FAILED (Bad Payload)';
-        }
+        if (receivedMessages.length > 0) receivedMessages[0].status = '❌ FAILED (Bad Payload)';
         return res.status(400).send('Invalid payload for signature check.');
     }
     const secret = process.env.CONNEXEASE_WEBHOOK_SECRET;
@@ -86,7 +81,7 @@ function verifyConnexeaseSignature(req, res, next) {
 
     if (signature !== expectedSignature) {
         if (receivedMessages.length > 0) {
-            receivedMessages[0].signature_ok = '❌ FAILED (Mismatch)';
+            receivedMessages[0].status = '❌ FAILED (Mismatch)';
         }
         console.error("Webhook signature verification FAILED!");
         return res.status(403).send('Invalid signature.');
@@ -124,94 +119,113 @@ async function sendConnexeaseReply(conversationId, messageText) {
     }
 }
 
-// --- NEW: Middleware to log all incoming messages for the dashboard ---
-// This will run for EVERY webhook request, even if security checks fail later.
+// --- Middleware to log all incoming messages for the dashboard ---
 function logMessageForDashboard(req, res, next) {
     const hookType = req.body.hook;
     const payload = req.body.payload;
-
-    // Check if it's a message we want to log
     if (hookType === 'message.created' || hookType === 'conversation.created') {
         const messageContent = payload.content || payload.messages?.content;
         const customer = payload.customer || payload.messages?.customer;
-
         if (messageContent) {
             const messageData = {
                 from: customer?.name || customer?.phone_number || 'Unknown',
                 content: messageContent,
                 timestamp: new Date().toLocaleString('tr-TR', { timeZone: 'Europe/Istanbul' }),
-                signature_ok: 'Pending' // We don't know the status yet
+                status: 'Pending'
             };
-            // Add the new message to the top of our list
             receivedMessages.unshift(messageData);
-            // Keep the list trimmed to the last 50 messages
-            if (receivedMessages.length > 50) {
-                receivedMessages.pop();
-            }
+            if (receivedMessages.length > 50) receivedMessages.pop();
         }
     }
-    next(); // IMPORTANT: Always continue to the next middleware
+    next();
 }
 
-// --- NEW: Dashboard Endpoint ---
+// --- UPDATED Dashboard Endpoint with New Design ---
 app.get('/dashboard', (req, res) => {
-    let messageHtml = receivedMessages.map(msg => `
-        <div class="message">
-            <p><strong>From:</strong> ${msg.from}</p>
-            <p><strong>Message:</strong> ${msg.content}</p>
-            <p><small>Time: ${msg.timestamp} | Signature: ${msg.signature_ok}</small></p>
+    const messagesHtml = receivedMessages.map(msg => {
+        let statusIcon, statusColor, statusText;
+        switch (msg.status) {
+            case '✅ Verified':
+                statusIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="h-4 w-4"><path d="M20 6 9 17l-5-5"></path></svg>`;
+                statusColor = 'text-green-400';
+                statusText = 'Verified';
+                break;
+            case '❌ FAILED (Mismatch)':
+            case '❌ FAILED (Missing)':
+            case '❌ FAILED (Bad Payload)':
+            case '❌ FAILED (IP Block)':
+                statusIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="h-4 w-4"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg>`;
+                statusColor = 'text-red-400';
+                statusText = 'Failed';
+                break;
+            default:
+                statusIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="h-4 w-4"><path d="M10 20a1 1 0 0 0 .553.895l2 1A1 1 0 0 0 14 21v-7a2 2 0 0 1 .517-1.341L21.74 4.67A1 1 0 0 0 21 3H3a1 1 0 0 0-.742 1.67l7.225 7.989A2 2 0 0 1 10 14z"></path></svg>`;
+                statusColor = 'text-yellow-400';
+                statusText = 'Processing';
+                break;
+        }
+
+        return `
+            <div class="relative flex items-start sm:items-center justify-between rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 mb-4 flex-col sm:flex-row">
+              <div class="pl-3 flex-grow mb-2 sm:mb-0">
+                <h3 class="text-base font-medium tracking-tight text-white">${msg.content}</h3>
+                <div class="mt-1 flex items-center gap-3 text-xs text-neutral-400">
+                  <span>From: ${msg.from}</span>
+                  <span>•</span>
+                  <span>${msg.timestamp}</span>
+                </div>
+              </div>
+              <div class="flex items-center gap-2 text-sm ${statusColor} pl-3 sm:pl-0">
+                ${statusIcon}
+                <span class="font-mono text-xs">${statusText}</span>
+              </div>
+            </div>`;
+    }).join('');
+
+    const dashboardHtml = `
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Message Dashboard</title>
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+        <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+        <script src="https://cdn.tailwindcss.com"></script>
+        <style>
+            .font-manrope { font-family: 'Manrope', sans-serif; }
+            @keyframes gradientFlow { 0% {background-position: 0% 50%;} 50% {background-position: 100% 50%;} 100% {background-position: 0% 50%;} }
+            .animate-gradient { background-size: 200% 200%; animation: gradientFlow 3s ease-in-out infinite; }
+        </style>
+    </head>
+    <body class="antialiased min-h-screen flex flex-col items-center text-neutral-200 bg-gradient-to-tl from-[#030408] to-[#283343] p-6" style="font-family:'Inter', sans-serif;">
+        <div class="w-full max-w-4xl text-center mb-12">
+            <h1 class="text-4xl md:text-5xl tracking-tight text-white mb-4 font-manrope font-medium">
+                Message <span class="bg-gradient-to-r from-[#2a7fff] via-[#0ea5e9] to-[#22d3ee] bg-clip-text text-transparent animate-gradient">Dashboard</span>
+            </h1>
+            <p class="text-lg md:text-xl text-neutral-400 max-w-2xl mx-auto">
+                Real-time log of incoming webhook messages.
+            </p>
         </div>
-    `).join('');
-
-    if (receivedMessages.length === 0) {
-        messageHtml = '<p>No messages received yet.</p>';
-    }
-
-    const html = `
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Message Dashboard</title>
-            <style>
-                body { font-family: sans-serif; background-color: #f4f4f9; color: #333; margin: 0; padding: 20px; }
-                h1 { text-align: center; color: #444; }
-                .container { max-width: 800px; margin: 0 auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-                .message { border-bottom: 1px solid #eee; padding: 15px 0; }
-                .message:last-child { border-bottom: none; }
-                .message p { margin: 5px 0; }
-                .message strong { color: #555; }
-                small { color: #888; }
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h1>Received Messages</h1>
-                ${messageHtml}
+        <div class="w-full max-w-4xl shadow-[0_20px_50px_-10px_rgba(0,0,0,0.6)] relative overflow-hidden border-white/10 border rounded-3xl backdrop-blur-sm">
+            <div class="p-8">
+                ${messagesHtml || '<p class="text-center text-neutral-400">No messages received yet. Send a message to the WhatsApp number to begin.</p>'}
             </div>
-        </body>
-        </html>
-    `;
-    res.send(html);
+        </div>
+    </body>
+    </html>`;
+    res.send(dashboardHtml);
 });
 
+
 // --- UPDATED Webhook Endpoint ---
-// We add the new logger function to run FIRST in the chain.
 app.post('/webhook', logMessageForDashboard, ipAllowlist, (req, res, next) => {
-    // This is a special step to update the dashboard log with the security status
-    if (receivedMessages.length > 0) {
-        receivedMessages[0].signature_ok = 'IP OK';
-    }
+    if (receivedMessages.length > 0) receivedMessages[0].status = 'IP OK';
     verifyConnexeaseSignature(req, res, next);
 }, async (req, res) => {
-    // This part only runs if ALL security checks pass.
-    if (receivedMessages.length > 0) {
-        receivedMessages[0].signature_ok = '✅ Verified';
-    }
+    if (receivedMessages.length > 0) receivedMessages[0].status = '✅ Verified';
     console.log("Webhook received and passed security checks:", JSON.stringify(req.body, null, 2));
     res.status(200).send('Event received');
-
     const hookType = req.body.hook;
     const payload = req.body.payload;
     if (hookType === 'message.created' && payload.customer && !payload.agent) {
@@ -227,7 +241,6 @@ app.post('/webhook', logMessageForDashboard, ipAllowlist, (req, res, next) => {
     } else if (hookType === 'conversation.created' && payload.messages?.content) {
         const userMessage = payload.messages.content;
         const conversationId = payload.uuid;
-
         if (userMessage && userMessage.trim() !== "") {
             console.log(`Processing first message in new conversation: "${userMessage}"`);
             const aiReply = await getAIResponse(userMessage);
@@ -237,6 +250,7 @@ app.post('/webhook', logMessageForDashboard, ipAllowlist, (req, res, next) => {
         }
     }
 });
+
 
 // --- Start Server ---
 const PORT = process.env.PORT || 3000;
