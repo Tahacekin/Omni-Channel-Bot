@@ -1,4 +1,4 @@
-// index.js (UPDATED with correct IP parsing)
+// index.js (UPDATED with a simple message dashboard)
 require('dotenv').config();
 const express = require('express');
 const fs = require('fs').promises;
@@ -18,7 +18,10 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-latest" });
 let knowledgeBase = '';
 
-// --- JWT Authentication section (no changes here) ---
+// --- NEW: In-memory store for the last 50 messages ---
+const receivedMessages = [];
+
+// --- JWT Authentication, IP Allowlist, Signature Verification ---
 let connexeaseToken = null;
 let tokenExpiresAt = null;
 
@@ -42,37 +45,33 @@ async function getConnexeaseToken() {
     }
 }
 
-// --- UPDATED: IP Allowlist Middleware ---
-// This function now correctly handles a list of IPs.
 function ipAllowlist(req, res, next) {
     const allowedIp = '34.89.215.92';
     const clientIpString = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-
     console.log(`Incoming request from IP chain: ${clientIpString}`);
-
-    // Split the string by commas and get the first IP in the list.
     const firstIp = clientIpString.split(',')[0].trim();
-
     if (firstIp === allowedIp) {
-        // The first IP matches, so we allow the request.
         console.log(`Allowing request as first IP '${firstIp}' matches.`);
         next();
     } else {
-        // The first IP does not match, block the request.
         console.warn(`Blocked request from unauthorized IP: ${firstIp}`);
         res.status(403).send('Forbidden: IP address not allowed.');
     }
 }
 
-
-// --- Webhook Signature Verification Middleware (no changes here) ---
 function verifyConnexeaseSignature(req, res, next) {
     const signature = req.headers['x-connexease-webhook-sign'];
     if (!signature) {
+        if (receivedMessages.length > 0) {
+            receivedMessages[0].signature_ok = '❌ FAILED (Missing)';
+        }
         return res.status(403).send('Signature missing.');
     }
     const channelUuid = req.body.channel?.uuid;
     if (!channelUuid) {
+        if (receivedMessages.length > 0) {
+            receivedMessages[0].signature_ok = '❌ FAILED (Bad Payload)';
+        }
         return res.status(400).send('Invalid payload for signature check.');
     }
     const secret = process.env.CONNEXEASE_WEBHOOK_SECRET;
@@ -86,6 +85,9 @@ function verifyConnexeaseSignature(req, res, next) {
     // -----------------------------------------
 
     if (signature !== expectedSignature) {
+        if (receivedMessages.length > 0) {
+            receivedMessages[0].signature_ok = '❌ FAILED (Mismatch)';
+        }
         console.error("Webhook signature verification FAILED!");
         return res.status(403).send('Invalid signature.');
     }
@@ -93,8 +95,7 @@ function verifyConnexeaseSignature(req, res, next) {
     next();
 }
 
-
-// --- AI and Connexease Reply Functions (no changes here) ---
+// --- AI and Connexease Reply Functions ---
 async function getAIResponse(userMessage) {
     if (!knowledgeBase) {
         knowledgeBase = await fs.readFile(path.join(__dirname, 'knowledgebase.txt'), 'utf-8');
@@ -123,8 +124,91 @@ async function sendConnexeaseReply(conversationId, messageText) {
     }
 }
 
-// --- Webhook Endpoint (no changes here) ---
-app.post('/webhook', ipAllowlist, verifyConnexeaseSignature, async (req, res) => {
+// --- NEW: Middleware to log all incoming messages for the dashboard ---
+// This will run for EVERY webhook request, even if security checks fail later.
+function logMessageForDashboard(req, res, next) {
+    const hookType = req.body.hook;
+    const payload = req.body.payload;
+
+    // Check if it's a message we want to log
+    if (hookType === 'message.created' || hookType === 'conversation.created') {
+        const messageContent = payload.content || payload.messages?.content;
+        const customer = payload.customer || payload.messages?.customer;
+
+        if (messageContent) {
+            const messageData = {
+                from: customer?.name || customer?.phone_number || 'Unknown',
+                content: messageContent,
+                timestamp: new Date().toLocaleString('tr-TR', { timeZone: 'Europe/Istanbul' }),
+                signature_ok: 'Pending' // We don't know the status yet
+            };
+            // Add the new message to the top of our list
+            receivedMessages.unshift(messageData);
+            // Keep the list trimmed to the last 50 messages
+            if (receivedMessages.length > 50) {
+                receivedMessages.pop();
+            }
+        }
+    }
+    next(); // IMPORTANT: Always continue to the next middleware
+}
+
+// --- NEW: Dashboard Endpoint ---
+app.get('/dashboard', (req, res) => {
+    let messageHtml = receivedMessages.map(msg => `
+        <div class="message">
+            <p><strong>From:</strong> ${msg.from}</p>
+            <p><strong>Message:</strong> ${msg.content}</p>
+            <p><small>Time: ${msg.timestamp} | Signature: ${msg.signature_ok}</small></p>
+        </div>
+    `).join('');
+
+    if (receivedMessages.length === 0) {
+        messageHtml = '<p>No messages received yet.</p>';
+    }
+
+    const html = `
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Message Dashboard</title>
+            <style>
+                body { font-family: sans-serif; background-color: #f4f4f9; color: #333; margin: 0; padding: 20px; }
+                h1 { text-align: center; color: #444; }
+                .container { max-width: 800px; margin: 0 auto; background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+                .message { border-bottom: 1px solid #eee; padding: 15px 0; }
+                .message:last-child { border-bottom: none; }
+                .message p { margin: 5px 0; }
+                .message strong { color: #555; }
+                small { color: #888; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>Received Messages</h1>
+                ${messageHtml}
+            </div>
+        </body>
+        </html>
+    `;
+    res.send(html);
+});
+
+// --- UPDATED Webhook Endpoint ---
+// We add the new logger function to run FIRST in the chain.
+app.post('/webhook', logMessageForDashboard, ipAllowlist, (req, res, next) => {
+    // This is a special step to update the dashboard log with the security status
+    if (receivedMessages.length > 0) {
+        receivedMessages[0].signature_ok = 'IP OK';
+    }
+    verifyConnexeaseSignature(req, res, next);
+}, async (req, res) => {
+    // This part only runs if ALL security checks pass.
+    if (receivedMessages.length > 0) {
+        receivedMessages[0].signature_ok = '✅ Verified';
+    }
     console.log("Webhook received and passed security checks:", JSON.stringify(req.body, null, 2));
     res.status(200).send('Event received');
 
@@ -143,18 +227,18 @@ app.post('/webhook', ipAllowlist, verifyConnexeaseSignature, async (req, res) =>
     } else if (hookType === 'conversation.created' && payload.messages?.content) {
         const userMessage = payload.messages.content;
         const conversationId = payload.uuid;
+
         if (userMessage && userMessage.trim() !== "") {
             console.log(`Processing first message in new conversation: "${userMessage}"`);
             const aiReply = await getAIResponse(userMessage);
             await sendConnexeaseReply(conversationId, aiReply);
         } else {
-            console.log("Received new<｜tool▁sep｜>conversation without text content, skipping.");
+            console.log("Received new conversation without text content, skipping.");
         }
     }
 });
 
-
-// --- Start Server (no changes here) ---
+// --- Start Server ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
     try {
