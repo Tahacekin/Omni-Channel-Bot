@@ -1,7 +1,4 @@
-// chat-history-pane: Show chat history for selected conversation (read-only)
-// right pane: Show AI-generated suggestions for responses
-
-// index.js (OPTIMIZED for Agent-Assist Dashboard - Production Ready)
+// index.js (UPDATED to use OpenAI)
 require('dotenv').config();
 const express = require('express');
 const http = require('http');
@@ -10,38 +7,27 @@ const fs = require('fs').promises;
 const path = require('path');
 const crypto = require('crypto');
 const axios = require('axios');
-const { GoogleGenerativeAI } = require("@google/generative-ai");
+// --- UPDATED: Import OpenAI library ---
+const OpenAI = require('openai');
 
-// --- INITIALIZATION ---
+// --- 1. INITIALIZATION ---
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// Initialize Google Gemini AI with optimized settings for agent assistance
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ 
-    model: "gemini-1.5-flash-latest",
-    generationConfig: {
-        temperature: 0.3, // Lower temperature for more consistent responses
-        maxOutputTokens: 500, // Limit response length for dashboard UI
-        topP: 0.8,
-        topK: 10
-    }
+// --- UPDATED: Initialize OpenAI ---
+const openai = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY,
 });
 
 let knowledgeBase = '';
 
-// --- CONVERSATION STORAGE ---
+// --- In-memory store for conversations ---
 const conversations = new Map();
 
-// Enable JSON parsing with raw body access for webhook signature verification
-app.use(express.json({ 
-    verify: (req, res, buf) => { 
-        req.rawBody = buf; 
-    } 
-}));
+app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 
-// --- WEBSOCKET LOGIC ---
+// --- 2. WEBSOCKET LOGIC ---
 wss.on('connection', ws => {
     console.log('Agent-Assist Dashboard connected');
     ws.on('close', () => console.log('Agent-Assist Dashboard disconnected'));
@@ -55,7 +41,7 @@ function broadcast(data) {
     });
 }
 
-// --- CONNEXEASE AUTHENTICATION ---
+// --- 3. SECURITY & API MIDDLEWARE ---
 let connexeaseToken = null;
 let tokenExpiresAt = null;
 
@@ -79,7 +65,6 @@ async function getConnexeaseToken() {
     }
 }
 
-// --- SECURITY MIDDLEWARE ---
 function ipAllowlist(req, res, next) {
     const allowedIp = '34.89.215.92';
     const clientIpString = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
@@ -106,21 +91,16 @@ function verifyConnexeaseSignature(req, res, next) {
     next();
 }
 
-// --- OPTIMIZED AI RESPONSE GENERATION ---
+// --- 4. getAIResponse Function (UPDATED for OpenAI) ---
 async function getAIResponse(userMessage) {
     if (!knowledgeBase) {
         knowledgeBase = await fs.readFile(path.join(__dirname, 'knowledgebase.txt'), 'utf-8');
     }
+    
+    // OpenAI uses a "System" prompt for instructions - optimized for agent assistance
+    const systemPrompt = `Sen bir müşteri hizmetleri asistanısın. Climed klinikleri için çalışan insan temsilcilerine WhatsApp mesajlarına yanıt önerileri sunuyorsun.
 
-    // Optimized prompt specifically for agent assistance
-    const fullPrompt = `Sen bir müşteri hizmetleri asistanısın. Climed klinikleri için çalışan insan temsilcilerine WhatsApp mesajlarına yanıt önerileri sunuyorsun.
-
-MÜŞTERİ MESAJI: "${userMessage}"
-
-BİLGİ BANKASI:
-${knowledgeBase}
-
-GÖREVİN: Verilen bilgi bankasına dayanarak, müşterinin sorusu/şikayeti/isteği için profesyonel, yardımcı ve Türkçe bir yanıt önerisi oluştur.
+Verilen bilgi bankasına dayanarak, müşterinin sorusu/şikayeti/isteği için profesyonel, yardımcı ve Türkçe bir yanıt önerisi oluştur.
 
 KURALLAR:
 1. Sadece bilgi bankasındaki bilgileri kullan
@@ -130,15 +110,22 @@ KURALLAR:
 5. Mevcut kliniği/uzmanı/randevu bilgilerini belirt
 6. Kopya yapılabilir format kullan
 
-ONERİLEN YANIT:
-`;
+BİLGİ BANKASI:
+${knowledgeBase}`;
 
     try {
-        const result = await model.generateContent(fullPrompt);
-        const response = result.response.candidates[0].content.parts[0].text;
-        return response.trim();
+        const completion = await openai.chat.completions.create({
+            model: "gpt-4o-mini", // Fast and cost-effective model
+            messages: [
+                { role: "system", content: systemPrompt },
+                { role: "user", content: `Müşteri mesajı: "${userMessage}"` }
+            ],
+            temperature: 0.3,
+            max_tokens: 200
+        });
+        return completion.choices[0].message.content.trim();
     } catch (error) {
-        console.error("AI Response generation error:", error);
+        console.error("Error getting AI response from OpenAI:", error);
         return "Müşteri talebi için özel bir yanıt hazırlanması gerekiyor.";
     }
 }
@@ -162,7 +149,7 @@ async function sendConnexeaseReply(conversationId, messageText) {
     }
 }
 
-// --- WEBHOOK HANDLER ---
+// --- 5. WEBHOOK HANDLER ---
 app.post('/webhook', ipAllowlist, verifyConnexeaseSignature, async (req, res) => {
     res.status(200).send('Event received');
 
@@ -230,7 +217,7 @@ app.post('/webhook', ipAllowlist, verifyConnexeaseSignature, async (req, res) =>
     }
 });
 
-// --- API ENDPOINTS FOR DASHBOARD ---
+// --- 6. API ENDPOINTS FOR DASHBOARD ---
 
 // Get all conversations sorted by most recent activity
 app.get('/api/conversations', (req, res) => {
@@ -262,7 +249,7 @@ app.get('/api/conversations/:id', (req, res) => {
     }
 });
 
-// --- AGENT-ASSIST DASHBOARD ---
+// --- 7. AGENT-ASSIST DASHBOARD ---
 app.get('/dashboard', (req, res) => {
     const dashboardHtml = `
     <!DOCTYPE html>
@@ -313,8 +300,8 @@ app.get('/dashboard', (req, res) => {
         <!-- RIGHT PANEL: AI Suggestions -->
         <div class="w-1/3 bg-gray-950 border-l border-gray-700 flex flex-col">
             <div class="p-4 border-b border-gray-700">
-                <h2 class="text-lg font-semibold text-green-400">AI Assistant</h2>
-                <p class="text-sm text-gray-400 mt-1">Suggested responses</p>
+                <h2 class="text-lg font-semibold text-green-400">OpenAI Assistant</h2>
+                <p class="text-sm text-gray-400 mt-1">AI-powered suggestions</p>
             </div>
             <div id="ai-suggestions" class="flex-1 overflow-y-auto p-4">
                 <!-- AI suggestions will appear here -->
@@ -521,7 +508,7 @@ app.get('/dashboard', (req, res) => {
                     <div class="w-6 h-6 bg-green-500 rounded-full flex items-center justify-center mr-2">
                         <span class="text-white text-xs font-bold">AI</span>
                     </div>
-                    <span class="text-sm font-semibold text-green-400">Suggested Response:</span>
+                    <span class="text-sm font-semibold text-green-400">OpenAI Suggested Response:</span>
                 </div>
                 <p class="text-sm text-gray-200 leading-relaxed">\${suggestion}</p>
                 <div class="mt-3 flex space-x-2">
@@ -576,13 +563,13 @@ app.get('/dashboard', (req, res) => {
     res.send(dashboardHtml);
 });
 
-// --- SERVER STARTUP ---
+// --- 8. START SERVER ---
 server.listen(process.env.PORT || 3000, async () => {
     try {
         knowledgeBase = await fs.readFile(path.join(__dirname, 'knowledgebase.txt'), 'utf-8');
-        console.log('✨ Agent-Assist Dashboard is ready!');
+        console.log('✨ OpenAI Agent-Assist Dashboard is ready!');
+        console.log('🤖 Powered by OpenAI GPT');
         console.log('📊 Knowledge base loaded successfully');
-        console.log('🤖 AI responses optimized for agent assistance');
     } catch (error) {
         console.error('❌ Failed to load knowledge base:', error);
     }
