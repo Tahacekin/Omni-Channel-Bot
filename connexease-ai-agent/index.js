@@ -1,4 +1,4 @@
-// index.js (UPDATED with IP Allowlist and Signature Verification)
+// index.js (UPDATED with correct IP parsing)
 require('dotenv').config();
 const express = require('express');
 const fs = require('fs').promises;
@@ -42,21 +42,24 @@ async function getConnexeaseToken() {
     }
 }
 
-// --- NEW: IP Allowlist Middleware ---
-// This function will run first to check the source IP of the request, as required by Connexease support.
+// --- UPDATED: IP Allowlist Middleware ---
+// This function now correctly handles a list of IPs.
 function ipAllowlist(req, res, next) {
     const allowedIp = '34.89.215.92';
-    // On platforms like Render, the real client IP is in the 'x-forwarded-for' header.
-    const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    const clientIpString = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
 
-    console.log(`Incoming request from IP: ${clientIp}`);
+    console.log(`Incoming request from IP chain: ${clientIpString}`);
 
-    if (clientIp === allowedIp) {
-        // IP matches the allowed IP, proceed to the next function (signature check)
+    // Split the string by commas and get the first IP in the list.
+    const firstIp = clientIpString.split(',')[0].trim();
+
+    if (firstIp === allowedIp) {
+        // The first IP matches, so we allow the request.
+        console.log(`Allowing request as first IP '${firstIp}' matches.`);
         next();
     } else {
-        // IP is not allowed, block the request and send a 'Forbidden' error
-        console.warn(`Blocked request from unauthorized IP: ${clientIp}`);
+        // The first IP does not match, block the request.
+        console.warn(`Blocked request from unauthorized IP: ${firstIp}`);
         res.status(403).send('Forbidden: IP address not allowed.');
     }
 }
@@ -114,8 +117,7 @@ async function sendConnexeaseReply(conversationId, messageText) {
     }
 }
 
-// --- UPDATED Webhook Endpoint ---
-// Now runs three functions in order: 1. IP Check, 2. Signature Check, 3. Main Logic
+// --- Webhook Endpoint (no changes here) ---
 app.post('/webhook', ipAllowlist, verifyConnexeaseSignature, async (req, res) => {
     console.log("Webhook received and passed security checks:", JSON.stringify(req.body, null, 2));
     res.status(200).send('Event received');
@@ -140,7 +142,7 @@ app.post('/webhook', ipAllowlist, verifyConnexeaseSignature, async (req, res) =>
             const aiReply = await getAIResponse(userMessage);
             await sendConnexeaseReply(conversationId, aiReply);
         } else {
-            console.log("Received new conversation without text content, skipping.");
+            console.log("Received new<｜tool▁sep｜>conversation without text content, skipping.");
         }
     }
 });
