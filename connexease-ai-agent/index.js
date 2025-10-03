@@ -91,14 +91,14 @@ function verifyConnexeaseSignature(req, res, next) {
     next();
 }
 
-// --- 4. getAIResponse Function (UPDATED for OpenAI) ---
+// --- 4. getAIResponse Function (UPDATED for OpenAI GPT-5 Responses API) ---
 async function getAIResponse(userMessage) {
     if (!knowledgeBase) {
         knowledgeBase = await fs.readFile(path.join(__dirname, 'knowledgebase.txt'), 'utf-8');
     }
     
-    // OpenAI uses a "System" prompt for instructions - optimized for agent assistance
-    const systemPrompt = `Sen bir müşteri hizmetleri asistanısın. Climed klinikleri için çalışan insan temsilcilerine WhatsApp mesajlarına yanıt önerileri sunuyorsun.
+    // GPT-5 Responses API with optimized instructions for agent assistance
+    const instructions = `Sen bir müşteri hizmetleri asistanısın. Climed klinikleri için çalışan insan temsilcilerine WhatsApp mesajlarına yanıt önerileri sunuyorsun.
 
 Verilen bilgi bankasına dayanarak, müşterinin sorusu/şikayeti/isteği için profesyonel, yardımcı ve Türkçe bir yanıt önerisi oluştur.
 
@@ -114,16 +114,15 @@ BİLGİ BANKASI:
 ${knowledgeBase}`;
 
     try {
-        const completion = await openai.chat.completions.create({
-            model: "gpt-4o-mini", // Fast and cost-effective model
-            messages: [
-                { role: "system", content: systemPrompt },
-                { role: "user", content: `Müşteri mesajı: "${userMessage}"` }
-            ],
-            temperature: 0.3,
-            max_tokens: 200
+        const response = await openai.responses.create({
+            model: "gpt-5-nano", // Fast, cost-effective for simple instruction-following
+            reasoning: { effort: "minimal" }, // Fastest response time
+            text: { verbosity: "low" }, // Concise responses perfect for agents
+            instructions: instructions,
+            input: `Müşteri mesajı: "${userMessage}"`
         });
-        return completion.choices[0].message.content.trim();
+        
+        return response.output_text || "Müşteri talebi için özel bir yanıt hazırlanması gerekiyor.";
     } catch (error) {
         console.error("Error getting AI response from OpenAI:", error);
         return "Müşteri talebi için özel bir yanıt hazırlanması gerekiyor.";
@@ -300,7 +299,7 @@ app.get('/dashboard', (req, res) => {
         <!-- RIGHT PANEL: AI Suggestions -->
         <div class="w-1/3 bg-gray-950 border-l border-gray-700 flex flex-col">
             <div class="p-4 border-b border-gray-700">
-                <h2 class="text-lg font-semibold text-green-400">OpenAI Assistant</h2>
+                <h2 class="text-lg font-semibold text-green-400">GPT-5 Assistant</h2>
                 <p class="text-sm text-gray-400 mt-1">AI-powered suggestions</p>
             </div>
             <div id="ai-suggestions" class="flex-1 overflow-y-auto p-4">
@@ -508,7 +507,7 @@ app.get('/dashboard', (req, res) => {
                     <div class="w-6 h-6 bg-green-500 rounded-full flex items-center justify-center mr-2">
                         <span class="text-white text-xs font-bold">AI</span>
                     </div>
-                    <span class="text-sm font-semibold text-green-400">OpenAI Suggested Response:</span>
+                    <span class="text-sm font-semibold text-green-400">GPT-5 Suggested Response:</span>
                 </div>
                 <p class="text-sm text-gray-200 leading-relaxed">\${suggestion}</p>
                 <div class="mt-3 flex space-x-2">
@@ -567,8 +566,8 @@ app.get('/dashboard', (req, res) => {
 server.listen(process.env.PORT || 3000, async () => {
     try {
         knowledgeBase = await fs.readFile(path.join(__dirname, 'knowledgebase.txt'), 'utf-8');
-        console.log('✨ OpenAI Agent-Assist Dashboard is ready!');
-        console.log('🤖 Powered by OpenAI GPT');
+        console.log('✨ GPT-5 Agent-Assist Dashboard is ready!');
+        console.log('🤖 Powered by OpenAI GPT-5 Nano');
         console.log('📊 Knowledge base loaded successfully');
     } catch (error) {
         console.error('❌ Failed to load knowledge base:', error);
