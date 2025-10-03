@@ -1,15 +1,14 @@
-// index.js (UPDATED with Webhook Verification and Correct Payload Parsing)
+// index.js (UPDATED with IP Allowlist and Signature Verification)
 require('dotenv').config();
 const express = require('express');
 const fs = require('fs').promises;
 const path = require('path');
-const crypto = require('crypto'); // Built-in Node.js module for cryptography
+const crypto = require('crypto');
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const axios = require('axios');
 
 // 1. Initialize App & AI
 const app = express();
-// IMPORTANT: We need the raw body for signature verification, so we use a custom parser.
 app.use(express.json({
     verify: (req, res, buf) => {
         req.rawBody = buf;
@@ -43,35 +42,46 @@ async function getConnexeaseToken() {
     }
 }
 
-// --- NEW: Webhook Signature Verification Middleware ---
+// --- NEW: IP Allowlist Middleware ---
+// This function will run first to check the source IP of the request, as required by Connexease support.
+function ipAllowlist(req, res, next) {
+    const allowedIp = '34.89.215.92';
+    // On platforms like Render, the real client IP is in the 'x-forwarded-for' header.
+    const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+
+    console.log(`Incoming request from IP: ${clientIp}`);
+
+    if (clientIp === allowedIp) {
+        // IP matches the allowed IP, proceed to the next function (signature check)
+        next();
+    } else {
+        // IP is not allowed, block the request and send a 'Forbidden' error
+        console.warn(`Blocked request from unauthorized IP: ${clientIp}`);
+        res.status(403).send('Forbidden: IP address not allowed.');
+    }
+}
+
+
+// --- Webhook Signature Verification Middleware (no changes here) ---
 function verifyConnexeaseSignature(req, res, next) {
     const signature = req.headers['x-connexease-webhook-sign'];
     if (!signature) {
-        console.warn("Request received without signature.");
         return res.status(403).send('Signature missing.');
     }
-
-    // According to docs, the signature is based on the channel's UUID.
-    // NOTE: Raw body is needed because JSON parsing can change spacing.
-    // However, the docs say to hash the channel_uuid, not the whole body. Let's follow that.
     const channelUuid = req.body.channel?.uuid;
     if (!channelUuid) {
-         console.warn("Request body missing channel.uuid for signature check.");
-         return res.status(400).send('Invalid payload for signature check.');
+        return res.status(400).send('Invalid payload for signature check.');
     }
-
     const secret = process.env.CONNEXEASE_WEBHOOK_SECRET;
     const hmac = crypto.createHmac('sha256', secret);
     hmac.update(channelUuid, 'utf-8');
     const expectedSignature = hmac.digest('base64');
-
     if (signature !== expectedSignature) {
         console.error("Webhook signature verification FAILED!");
         return res.status(403).send('Invalid signature.');
     }
-
     console.log("Webhook signature verified successfully.");
-    next(); // If the signature is valid, proceed to the main handler.
+    next();
 }
 
 
@@ -105,40 +115,32 @@ async function sendConnexeaseReply(conversationId, messageText) {
 }
 
 // --- UPDATED Webhook Endpoint ---
-// The `verifyConnexeaseSignature` function will run first.
-app.post('/webhook', verifyConnexeaseSignature, async (req, res) => {
-    console.log("Webhook received:", JSON.stringify(req.body, null, 2));
-    
-    // Respond immediately with a 200 OK to acknowledge receipt.
+// Now runs three functions in order: 1. IP Check, 2. Signature Check, 3. Main Logic
+app.post('/webhook', ipAllowlist, verifyConnexeaseSignature, async (req, res) => {
+    console.log("Webhook received and passed security checks:", JSON.stringify(req.body, null, 2));
     res.status(200).send('Event received');
 
     const hookType = req.body.hook;
     const payload = req.body.payload;
-
-    // We only care about new messages created by a customer.
     if (hookType === 'message.created' && payload.customer && !payload.agent) {
         const userMessage = payload.content;
         const conversationId = payload.conversation_uuid;
-
-        // Ensure the message has text content before processing.
         if (userMessage && userMessage.trim() !== "") {
             console.log(`Processing message from customer: "${userMessage}"`);
             const aiReply = await getAIResponse(userMessage);
             await sendConnexeaseReply(conversationId, aiReply);
         } else {
-            console.log("Received message without text content (e.g., media), skipping AI reply.");
+            console.log("Received message without text content, skipping.");
         }
     } else if (hookType === 'conversation.created' && payload.messages?.content) {
-        // Also handle the first message in a conversation.
         const userMessage = payload.messages.content;
-        const conversationId = payload.uuid; // For this hook, the conversation ID is payload.uuid
-
+        const conversationId = payload.uuid;
         if (userMessage && userMessage.trim() !== "") {
-             console.log(`Processing first message in new conversation: "${userMessage}"`);
-             const aiReply = await getAIResponse(userMessage);
-             await sendConnexeaseReply(conversationId, aiReply);
+            console.log(`Processing first message in new conversation: "${userMessage}"`);
+            const aiReply = await getAIResponse(userMessage);
+            await sendConnexeaseReply(conversationId, aiReply);
         } else {
-             console.log("Received new conversation without text content, skipping AI reply.");
+            console.log("Received new conversation without text content, skipping.");
         }
     }
 });
