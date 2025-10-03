@@ -74,23 +74,20 @@ function ipAllowlist(req, res, next) {
     }
 }
 
-// PASTE THIS ENTIRE FUNCTION INTO YOUR index.js FILE
+// This is the permanent function based on Connexease's instructions.
 function verifyConnexeaseSignature(req, res, next) {
     const signature = req.headers['x-connexease-webhook-sign'];
     const secret = process.env.CONNEXEASE_WEBHOOK_SECRET;
 
-    // Log for debugging
-    console.log(`Received Signature: |${signature}|`);
-    console.log(`Secret Key to Match: |${secret}|`);
-
-    // TEMPORARY FIX: Check if the received signature is just the raw secret key.
+    // Connexease has confirmed they send the raw secret, not a signature.
+    // So, we will check if the 'signature' header matches our secret.
     if (signature !== secret) {
-        console.error("Webhook signature verification FAILED! The received signature does not match the secret key.");
+        console.error("Verification FAILED: The value in X-Connexease-Webhook-Sign does not match the secret key.");
         return res.status(403).send('Invalid signature.');
     }
 
     // If the check passes, we proceed.
-    console.log("Webhook signature check PASSED (using temporary method).");
+    console.log("Verification PASSED (matching raw secret key as requested by Connexease).");
     next();
 }
 
