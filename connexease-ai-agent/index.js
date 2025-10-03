@@ -79,6 +79,12 @@ function verifyConnexeaseSignature(req, res, next) {
     const hmac = crypto.createHmac('sha256', secret);
     hmac.update(channelUuid, 'utf-8');
     const expectedSignature = hmac.digest('base64');
+
+    // --- ADD THESE TWO LINES FOR DEBUGGING ---
+    console.log(`Received Signature:  |${signature}|`);
+    console.log(`Generated Signature: |${expectedSignature}|`);
+    // -----------------------------------------
+
     if (signature !== expectedSignature) {
         console.error("Webhook signature verification FAILED!");
         return res.status(403).send('Invalid signature.');
