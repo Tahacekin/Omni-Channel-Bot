@@ -1,4 +1,4 @@
-// index.js (UPDATED for Agent-Assist Dashboard with WebSockets)
+// index.js (UPDATED for Vertex AI)
 require('dotenv').config();
 const express = require('express');
 const http = require('http');
@@ -6,20 +6,26 @@ const WebSocket = require('ws');
 const fs = require('fs').promises;
 const path = require('path');
 const crypto = require('crypto');
-const { GoogleGenerativeAI } = require("@google/generative-ai");
 const axios = require('axios');
+// --- UPDATED: Import Vertex AI library ---
+const { VertexAI } = require('@google-cloud/vertexai');
 
 // --- 1. INITIALIZATION ---
 const app = express();
-const server = http.createServer(app); // Express app will run on an HTTP server
-const wss = new WebSocket.Server({ server }); // WebSocket server will share the same server
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash-latest" });
+// --- UPDATED: Initialize Vertex AI ---
+const vertex_ai = new VertexAI({
+    project: process.env.GOOGLE_CLOUD_PROJECT_ID,
+    location: process.env.GOOGLE_CLOUD_LOCATION,
+});
+const model = vertex_ai.getGenerativeModel({
+    model: 'gemini-1.5-flash-latest', // Using available model name
+});
 let knowledgeBase = '';
 
-// --- In-memory store for conversations (more advanced than just messages) ---
-// We'll store conversations keyed by their ID
+// --- In-memory store for conversations ---
 const conversations = new Map();
 
 app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
@@ -74,7 +80,6 @@ function ipAllowlist(req, res, next) {
     }
 }
 
-// This is the permanent function based on Connexease's instructions.
 function verifyConnexeaseSignature(req, res, next) {
     const signature = req.headers['x-connexease-webhook-sign'];
     const secret = process.env.CONNEXEASE_WEBHOOK_SECRET;
@@ -91,17 +96,21 @@ function verifyConnexeaseSignature(req, res, next) {
     next();
 }
 
+// --- UPDATED: getAIResponse Function for Vertex AI ---
 async function getAIResponse(userMessage) {
     if (!knowledgeBase) {
         knowledgeBase = await fs.readFile(path.join(__dirname, 'knowledgebase.txt'), 'utf-8');
     }
-    const fullPrompt = `You are an AI assistant suggesting replies for a human agent. Based on the user's message, provide a helpful and concise response. USER MESSAGE: "${userMessage}" --- KNOWLEDGE BASE: ${knowledgeBase} --- SUGGESTED RESPONSE (in TURKISH):`;
+    const fullPrompt = `You are an AI assistant suggesting replies for a human agent. Based on the user's message, provide a helpful and concise response. USER MESSAGE: "${userMessage}" --- KNOWLEDGE BASE: ${knowledgeBase} --- the knowledge base is extensive with clinic locations, doctors, treatments, and pricing. Please provide a helpful Turkish response.`;
+    
     try {
-        const result = await model.generateContent(fullPrompt);
-        return result.response.text();
+        const req = { contents: [{ role: 'user', parts: [{ text: fullPrompt }] }] };
+        const result = await model.generateContent(req);
+        const response = result.response;
+        return response.candidates[0].content.parts[0].text;
     } catch (error) {
-        console.error("Error getting AI response:", error);
-        return "Sorry, I couldn't generate a suggestion.";
+        console.error("Error getting AI response from Vertex AI:", error);
+        return "Üzgünüm, şu anda bir öneri oluşturamıyorum. Lütfen tekrar deneyin.";
     }
 }
 
@@ -119,16 +128,16 @@ async function sendConnexeaseReply(conversationId, messageText) {
     }
 }
 
-// --- 4. WEBHOOK HANDLER (UPDATED TO STORE & BROADCAST) ---
+// --- 4. WEBHOOK HANDLER ---
 app.post('/webhook', ipAllowlist, verifyConnexeaseSignature, async (req, res) => {
-    res.status(200).send('Event received'); // Acknowledge immediately
+    res.status(200).send('Event received');
 
     const hookType = req.body.hook;
     const payload = req.body.payload;
     let conversationId, message;
 
     if (hookType === 'message.created') {
-        if (!payload.customer) return; // Ignore agent messages
+        if (!payload.customer) return;
         conversationId = payload.conversation_uuid;
         message = {
             sender: 'customer',
@@ -143,7 +152,7 @@ app.post('/webhook', ipAllowlist, verifyConnexeaseSignature, async (req, res) =>
             timestamp: new Date().toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })
         };
     } else {
-        return; // We don't care about other event types for now
+        return;
     }
 
     if (!message || !message.content) return;
@@ -167,18 +176,16 @@ app.post('/webhook', ipAllowlist, verifyConnexeaseSignature, async (req, res) =>
     broadcast({ type: 'aiSuggestion', payload: { conversationId, suggestion: aiSuggestion } });
 });
 
-// --- 5. API ENDPOINTS FOR THE DASHBOARD ---
-// Endpoint to get the list of conversations
+// --- 5. API ENDPOINTS ---
 app.get('/api/conversations', (req, res) => {
     const convoList = Array.from(conversations.values()).map(c => ({
         id: c.id,
         name: c.customer?.name || c.customer?.phone_number || 'Unknown',
-        lastMessage: c.messages[c.messages.length - 1]?.content.substring(0, 30) + '...' || 'No messages yet'
-    }));
+        lastMessage: c.messages.length > 0 ? c.messages[c.messages.length - 1].content.substring(0, 30) + '...' : 'No messages yet'
+    })).reverse();
     res.json(convoList);
 });
 
-// Endpoint to get the messages for a specific conversation
 app.get('/api/conversations/:id', (req, res) => {
     const conversation = conversations.get(req.params.id);
     if (conversation) {
@@ -188,7 +195,7 @@ app.get('/api/conversations/:id', (req, res) => {
     }
 });
 
-// --- 6. THE NEW DASHBOARD FRONT-END ---
+// --- 6. DASHBOARD ---
 app.get('/dashboard', (req, res) => {
     const dashboardHtml = `
     <!DOCTYPE html>
@@ -273,7 +280,7 @@ app.get('/dashboard', (req, res) => {
                 convoEl.id = \`convo-\${convo.id}\`;
                 convoEl.innerHTML = \`
                     <p class="font-semibold">\${convo.name}</p>
-                    <p class="text-smult text-gray-400 truncate">\${convo.lastMessage}</p>
+                    <p class="text-sm text-gray-400 truncate">\${convo.lastMessage}</p>
                 \`;
                 convoEl.onclick = () => loadConversationMessages(convo.id, convo.name);
                 chatListContainer.appendChild(convoEl);
@@ -288,7 +295,7 @@ app.get('/dashboard', (req, res) => {
             document.getElementById(\`convo-\${convoId}\`)?.classList.add('bg-blue-900/50');
 
             chatHeader.innerHTML = \`<h2 class="text-lg font-semibold text-white">\${name}</h2>\`;
-            messageContainer.innerHTML = '<p class="text-center text-gray-506">' +
+            messageContainer.innerHTML = '<p class="text-center text-gray-500">' +
                                        'Loading messages...</p>';
             aiSuggestionsContainer.innerHTML = '';
             
@@ -356,15 +363,13 @@ app.get('/dashboard', (req, res) => {
     res.send(dashboardHtml);
 });
 
-
 // --- 7. START SERVER ---
-// We use server.listen instead of app.listen to handle both HTTP and WebSocket traffic
 server.listen(process.env.PORT || 3000, async () => {
     try {
         knowledgeBase = await fs.readFile(path.join(__dirname, 'knowledgebase.txt'), 'utf-8');
         console.log('Knowledge base loaded.');
     } catch (error) {
-        console.error('Failed to load knowledge base on startup:', error);
+        console.error('Failed to load knowledge base:', error);
     }
     console.log(`Server is running on port ${process.env.PORT || 3000}`);
 });
